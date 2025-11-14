@@ -4,6 +4,7 @@ import os
 import sys
 import math
 from pathlib import Path
+from typing import Dict
 
 # Add parent directory to path so we can import from project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -13,6 +14,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
 from transformer_model import TransformerModel, count_parameters
+from lstm_model import LSTMFusionModel
 from data_utils import MultimodalWindowDataset, collate_fn
 import numpy as np
 
@@ -87,6 +89,10 @@ def compute_metrics(y_true, y_pred):
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
     acc = (tp + tn) / max((tp + tn + fp + fn), 1)
     return {'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn, 'precision': prec, 'recall': rec, 'f1': f1, 'accuracy': acc}
+
+
+def format_confusion_counts(metrics: Dict[str, float]) -> str:
+    return f"TP={metrics['tp']} FP={metrics['fp']} TN={metrics['tn']} FN={metrics['fn']}"
 
 
 def aggregate_by_sequence(preds, labels, sequence_indices, reduction: str):
@@ -184,7 +190,7 @@ def focal_loss_logits(logits, targets, gamma=2.0, alpha=0.25, eps=1e-6):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--data', default='datasets/npz')
+    p.add_argument('--data', default='datasets/processed/dataverse_npz')
     p.add_argument('--seq_len', type=int, default=30)
     p.add_argument('--batch', type=int, default=16)
     p.add_argument('--device', default='auto')
@@ -205,9 +211,12 @@ def main():
     p.add_argument('--save-best-only', action='store_true', help='only save checkpoint for best validation F1')
     p.add_argument('--early-stop-patience', type=int, default=10, help='early stopping patience (increased from 0)')
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--model-type', choices=['transformer', 'lstm'], default='transformer', help='backbone architecture to use')
     p.add_argument('--d-model', type=int, default=128, help='model dimension (reduced from 256 for stability)')
-    p.add_argument('--nhead', type=int, default=4, help='number of attention heads (reduced from 8)')
-    p.add_argument('--num-layers', type=int, default=3, help='number of transformer layers (reduced from 4)')
+    p.add_argument('--nhead', type=int, default=4, help='number of attention heads (transformer only)')
+    p.add_argument('--num-layers', type=int, default=3, help='number of transformer/LSTM layers')
+    p.add_argument('--lstm-bidirectional', action='store_true', help='use bidirectional LSTM fusion (only for model-type=lstm)')
+    p.add_argument('--lstm-dropout', type=float, default=0.1, help='dropout applied between stacked LSTM layers')
     p.add_argument('--pretrained-ckpt', type=str, default=None, help='path to pretrained model checkpoint to load encoder weights')
     p.add_argument('--pose-only', action='store_true', help='mask out all non-pose modalities during training and evaluation')
     p.add_argument('--eval-level', choices=['window', 'sequence', 'both'], default='sequence', help='metric used for model selection')
@@ -226,7 +235,14 @@ def main():
     root = Path(args.data)
     files = sorted([str(p) for p in root.rglob('*.npz')])
     if len(files) == 0:
-        raise RuntimeError('No npz files found under ' + str(root))
+        suggestions = []
+        for candidate in [Path('datasets/processed/dataverse_npz'), Path('datasets/processed/mint_npz')]:
+            if candidate.exists() and any(candidate.rglob('*.npz')):
+                suggestions.append(str(candidate))
+        hint = f"No npz files found under {root}"
+        if suggestions:
+            hint += ". Consider pointing --data to one of: " + ", ".join(suggestions)
+        raise RuntimeError(hint)
 
     random.shuffle(files)
     split = int((1.0 - args.val_ratio) * len(files))
@@ -288,40 +304,51 @@ def main():
     effective_train_steps = args.train_steps if args.train_steps is not None else math.ceil(len(train_ds) / args.batch)
     print(f'Training batches per epoch: {effective_train_steps}')
 
-    # Model with dynamic pose encoder support
-    model = TransformerModel(
-        pose_feats=pose_feats,  # Can be None for fully dynamic
-        traj_feats=traj_feats, 
-        d_model=args.d_model, 
-        nhead=args.nhead, 
-        num_layers=args.num_layers, 
-        num_classes=2
-    )
+    if args.model_type == 'transformer':
+        model = TransformerModel(
+            pose_feats=pose_feats,
+            traj_feats=traj_feats,
+            d_model=args.d_model,
+            nhead=args.nhead,
+            num_layers=args.num_layers,
+            num_classes=2,
+        )
+    else:
+        model = LSTMFusionModel(
+            pose_feats=pose_feats,
+            traj_feats=traj_feats,
+            d_model=args.d_model,
+            num_layers=args.num_layers,
+            num_classes=2,
+            bidirectional=args.lstm_bidirectional,
+            lstm_dropout=args.lstm_dropout,
+        )
     model.to(device)
     print('Model params:', count_parameters(model))
     
-    # Load pretrained weights if provided
+    # Load pretrained weights if provided (transformer-only for now)
     if args.pretrained_ckpt:
-        print(f"\nLoading pretrained encoder from: {args.pretrained_ckpt}")
-        try:
-            ckpt = torch.load(args.pretrained_ckpt, map_location=device)
-            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-                ckpt_state = ckpt['model_state_dict']
-            else:
-                ckpt_state = ckpt
-            # Load only the encoder weights (pose_encoders, traj_encoder, transformer)
-            # but not the classification heads
-            model_state = model.state_dict()
-            pretrained_state = {
-                k: v for k, v in ckpt_state.items()
-                if k in model_state and not k.startswith('intent_head') and not k.startswith('future_head')
-            }
-            model_state.update(pretrained_state)
-            model.load_state_dict(model_state)
-            print(f"✓ Loaded {len(pretrained_state)} pretrained parameters")
-        except Exception as e:
-            print(f"⚠️  Failed to load pretrained checkpoint: {e}")
-            print("   Continuing with random initialization...")
+        if args.model_type != 'transformer':
+            print("⚠️  Pretrained checkpoints are only supported for the transformer backbone right now; skipping load.")
+        else:
+            print(f"\nLoading pretrained encoder from: {args.pretrained_ckpt}")
+            try:
+                ckpt = torch.load(args.pretrained_ckpt, map_location=device)
+                if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+                    ckpt_state = ckpt['model_state_dict']
+                else:
+                    ckpt_state = ckpt
+                model_state = model.state_dict()
+                pretrained_state = {
+                    k: v for k, v in ckpt_state.items()
+                    if k in model_state and not k.startswith('intent_head') and not k.startswith('future_head')
+                }
+                model_state.update(pretrained_state)
+                model.load_state_dict(model_state)
+                print(f"✓ Loaded {len(pretrained_state)} pretrained parameters")
+            except Exception as e:
+                print(f"⚠️  Failed to load pretrained checkpoint: {e}")
+                print("   Continuing with random initialization...")
 
     optim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
 
@@ -379,7 +406,7 @@ def main():
         current_lr = optim.param_groups[0]['lr']
         print(f'Epoch {epoch+1}/{args.epochs} train_steps={train_steps} lr={current_lr:.6f} '
               f'loss={avg_loss:.4f} (main={avg_loss_main:.4f}, aux={avg_loss_aux:.4f}) '
-              f'acc={train_met["accuracy"]:.3f} f1={train_met["f1"]:.3f}')
+          f'acc={train_met["accuracy"]:.3f} f1={train_met["f1"]:.3f} | {format_confusion_counts(train_met)}')
 
         # === Validation ===
         model.eval()
@@ -417,9 +444,12 @@ def main():
             seq_metrics = compute_metrics(seq_true, seq_pred)
 
         print(f'  val: loss={avg_val_loss:.4f} (main={avg_val_loss_main:.4f}, aux={avg_val_loss_aux:.4f}) '
-              f'win_acc={window_metrics["accuracy"]:.3f} win_f1={window_metrics["f1"]:.3f}', end='')
+              f'win_acc={window_metrics["accuracy"]:.3f} win_f1={window_metrics["f1"]:.3f} '
+              f'| {format_confusion_counts(window_metrics)}', end='')
         if seq_metrics is not None:
-            print(f' | seq_acc={seq_metrics["accuracy"]:.3f} seq_f1={seq_metrics["f1"]:.3f}')
+            seq_counts = format_confusion_counts(seq_metrics)
+            print(f' || seq_acc={seq_metrics["accuracy"]:.3f} seq_f1={seq_metrics["f1"]:.3f} '
+                  f'| {seq_counts}')
         else:
             print()
 

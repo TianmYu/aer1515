@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from numpy.lib import npyio
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -248,7 +249,7 @@ class MultimodalWindowDataset(Dataset):
 
     def _read_window_multimodal(
         self,
-        arr: np.lib.npyio.NpzFile,
+    arr: npyio.NpzFile,
         start: int,
     ) -> Dict[str, Union[np.ndarray, float, int]]:
         pose_data = arr.get("pose")
@@ -270,7 +271,15 @@ class MultimodalWindowDataset(Dataset):
         ).astype(np.int64, copy=False)
 
         label = int(frame_labels.max()) if frame_labels.size else 0
-        intent = int(arr["intent_label"].item()) if "intent_label" in arr else label
+
+        future_arr = arr.get("future_labels")
+        if future_arr is not None:
+            future_window = _slice_with_pad(future_arr, start, self.seq_len, None, np.int64).astype(
+                np.int64, copy=False
+            )
+            future_label = int(future_window.max()) if future_window.size else 0
+        else:
+            future_label = int(arr["intent_label"].item()) if "intent_label" in arr else label
 
         def _presence(idx: int, tensor: Optional[np.ndarray]) -> float:
             if mask.shape[1] > idx:
@@ -294,8 +303,8 @@ class MultimodalWindowDataset(Dataset):
             "modality_mask": mask.astype(np.float32, copy=False),
             "frame_labels": frame_labels,
             "label": label,
-            "future_label": intent,
-            "intent_label": intent,
+            "future_label": future_label,
+            "intent_label": future_label,
             "has_pose": has_pose,
             "has_gaze": has_gaze,
             "has_emotion": has_emotion,
@@ -305,7 +314,7 @@ class MultimodalWindowDataset(Dataset):
 
     def _read_window_legacy(
         self,
-        arr: np.lib.npyio.NpzFile,
+    arr: npyio.NpzFile,
         start: int,
     ) -> Dict[str, Union[np.ndarray, float, int]]:
         pose_data = arr.get("pose")
