@@ -2,6 +2,7 @@ import argparse
 import random
 import os
 import sys
+import math
 from pathlib import Path
 
 # Add parent directory to path so we can import from project root
@@ -14,6 +15,51 @@ import torch.nn.functional as F
 from transformer_model import TransformerModel, count_parameters
 from data_utils import MultimodalWindowDataset, collate_fn
 import numpy as np
+
+
+TENSOR_KEYS = [
+    'pose',
+    'gaze',
+    'emotion',
+    'traj',
+    'robot',
+    'modality_mask',
+    'frame_labels',
+    'label',
+    'future_label',
+    'intent_label',
+    'sequence_label',
+    'has_pose',
+    'has_gaze',
+    'has_emotion',
+    'has_traj',
+    'has_robot',
+    'source_index',
+    'window_index',
+]
+
+
+def get_intent_targets(batch):
+    if 'intent_label' in batch:
+        return batch['intent_label']
+    if 'future_label' in batch:
+        return batch['future_label']
+    raise KeyError('Batch must contain intent_label or future_label')
+
+
+def strip_to_pose_only(batch):
+    drop_modalities = ['gaze', 'emotion', 'traj', 'robot']
+    for key in drop_modalities:
+        batch.pop(key, None)
+    for key in ['has_gaze', 'has_emotion', 'has_traj', 'has_robot']:
+        batch.pop(key, None)
+    mask = batch.get('modality_mask')
+    if torch.is_tensor(mask):
+        # Keep pose mask and zero-out other modalities so encoders can ignore padding.
+        pose_mask = mask[..., :1]
+        zeros = torch.zeros_like(mask[..., 1:])
+        batch['modality_mask'] = torch.cat([pose_mask, zeros], dim=-1)
+    return batch
 
 
 def set_seed(seed: int):
@@ -43,6 +89,82 @@ def compute_metrics(y_true, y_pred):
     return {'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn, 'precision': prec, 'recall': rec, 'f1': f1, 'accuracy': acc}
 
 
+def aggregate_by_sequence(preds, labels, sequence_indices, reduction: str):
+    grouped_preds = {}
+    grouped_labels = {}
+    for pred, label, seq_idx in zip(preds, labels, sequence_indices):
+        seq_idx = int(seq_idx)
+        grouped_preds.setdefault(seq_idx, []).append(int(pred))
+        grouped_labels.setdefault(seq_idx, int(label))
+
+    agg_preds = []
+    agg_labels = []
+    for seq_idx, values in grouped_preds.items():
+        if reduction == 'majority':
+            agg_pred = 1 if sum(values) >= (len(values) / 2.0) else 0
+        else:
+            agg_pred = 1 if any(values) else 0
+        agg_preds.append(agg_pred)
+        agg_labels.append(grouped_labels.get(seq_idx, 0))
+    return agg_labels, agg_preds
+
+
+def move_batch_to_device(batch, device, pose_only: bool):
+    if pose_only:
+        strip_to_pose_only(batch)
+    for key in TENSOR_KEYS:
+        tensor = batch.get(key)
+        if torch.is_tensor(tensor):
+            batch[key] = tensor.to(device)
+    return batch
+
+
+def compute_losses(out, batch, class_weights, args, device):
+    logits = out['intent_logits']
+    labels = get_intent_targets(batch)
+    smoothing = getattr(args, 'label_smoothing', 0.0)
+    if class_weights is not None:
+        loss_main = torch.nn.functional.cross_entropy(logits, labels, weight=class_weights, label_smoothing=smoothing)
+    else:
+        loss_main = torch.nn.functional.cross_entropy(logits, labels, label_smoothing=smoothing)
+
+    loss_aux = torch.tensor(0.0, device=device)
+    if 'future_logits' in out and ('intent_label' in batch or 'future_label' in batch or 'label' in batch):
+        fut_logits = out['future_logits']
+        future_targets = batch.get('intent_label', batch.get('future_label', batch.get('label'))).float()
+        if fut_logits.ndim == 2 and fut_logits.shape[1] == 1:
+            fut_logits = fut_logits.squeeze(-1)
+        if future_targets.ndim == 1 and fut_logits.ndim == 2:
+            future_targets = future_targets.unsqueeze(-1).expand_as(fut_logits)
+        if future_targets.ndim == 2 and fut_logits.ndim == 1:
+            future_targets = future_targets.squeeze(-1)
+        if args.use_focal:
+            loss_aux = focal_loss_logits(fut_logits, future_targets, gamma=args.focal_gamma, alpha=args.focal_alpha)
+        else:
+            pos = (future_targets == 1).float().sum()
+            neg = (future_targets == 0).float().sum()
+            pos_weight = (neg / (pos + 1e-6)) if pos > 0 else 1.0
+            bce = torch.nn.BCEWithLogitsLoss(pos_weight=torch.as_tensor(pos_weight, device=device))
+            loss_aux = bce(fut_logits, future_targets)
+    return loss_main, loss_aux
+
+
+def summarize_dataset(ds: MultimodalWindowDataset, name: str) -> None:
+    infos = ds.file_infos
+    if not infos:
+        print(f'{name}: no usable sequences (length < seq_len)')
+        return
+    seq_total = len(infos)
+    seq_pos = sum(info.get('intent_label', 0) for info in infos)
+    frame_total = sum(info.get('frame_total', 0) for info in infos)
+    frame_pos = sum(info.get('frame_positive', 0) for info in infos)
+    windows = len(ds)
+    seq_pct = (seq_pos / seq_total * 100.0) if seq_total else 0.0
+    frame_pct = (frame_pos / frame_total * 100.0) if frame_total else 0.0
+    print(f'{name}: sequences={seq_total} pos={seq_pos} ({seq_pct:.1f}%) '
+          f'frames_pos={frame_pos}/{frame_total} ({frame_pct:.1f}%) windows={windows}')
+
+
 def focal_loss_logits(logits, targets, gamma=2.0, alpha=0.25, eps=1e-6):
     """Focal loss for binary classification from logits.
     
@@ -66,12 +188,14 @@ def main():
     p.add_argument('--seq_len', type=int, default=30)
     p.add_argument('--batch', type=int, default=16)
     p.add_argument('--device', default='auto')
-    p.add_argument('--train-steps', type=int, default=300, help='max training batches per epoch (increased from 200 to see more data)')
+    p.add_argument('--train-steps', type=int, default=None, help='max training batches per epoch (default: cover entire dataset)')
     p.add_argument('--epochs', type=int, default=10, help='number of epochs')
+    p.add_argument('--val-ratio', type=float, default=0.1, help='fraction of files reserved for validation')
+    p.add_argument('--stride', type=int, default=None, help='window stride (default: seq_len//2)')
     p.add_argument('--lr', type=float, default=3e-4, help='learning rate (reduced from 1e-3 for stability)')
     p.add_argument('--weight-decay', type=float, default=1e-4, help='AdamW weight decay')
     p.add_argument('--grad-clip', type=float, default=0.5, help='gradient clipping norm (reduced from 1.0 for stability)')
-    p.add_argument('--weighted-sampler', action='store_true', help='use WeightedRandomSampler to balance classes by future_label')
+    p.add_argument('--weighted-sampler', action='store_true', help='use WeightedRandomSampler to balance classes by intent_label')
     p.add_argument('--class-weighted', action='store_true', help='use class weights for CrossEntropy on the main intent head')
     p.add_argument('--use-focal', action='store_true', help='use focal loss for future interaction auxiliary head')
     p.add_argument('--focal-gamma', type=float, default=2.0, help='focal loss gamma parameter')
@@ -85,6 +209,10 @@ def main():
     p.add_argument('--nhead', type=int, default=4, help='number of attention heads (reduced from 8)')
     p.add_argument('--num-layers', type=int, default=3, help='number of transformer layers (reduced from 4)')
     p.add_argument('--pretrained-ckpt', type=str, default=None, help='path to pretrained model checkpoint to load encoder weights')
+    p.add_argument('--pose-only', action='store_true', help='mask out all non-pose modalities during training and evaluation')
+    p.add_argument('--eval-level', choices=['window', 'sequence', 'both'], default='sequence', help='metric used for model selection')
+    p.add_argument('--sequence-agg', choices=['any', 'majority'], default='majority', help='how to aggregate window predictions at sequence level')
+    p.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing applied to main intent loss')
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -101,23 +229,24 @@ def main():
         raise RuntimeError('No npz files found under ' + str(root))
 
     random.shuffle(files)
-    split = int(0.9 * len(files))
+    split = int((1.0 - args.val_ratio) * len(files))
+    split = min(max(split, 1), len(files) - 1) if len(files) > 1 else len(files)
     train_files = files[:split]
     val_files = files[split:]
     print(f'Found {len(files)} files; train {len(train_files)} val {len(val_files)}')
 
-    train_ds = MultimodalWindowDataset(args.data, seq_len=args.seq_len, stride=args.seq_len // 2, files=train_files, backend='npz')
-    val_ds = MultimodalWindowDataset(args.data, seq_len=args.seq_len, stride=args.seq_len // 2, files=val_files, backend='npz')
+    stride = args.stride if args.stride is not None else max(1, args.seq_len // 2)
+    train_ds = MultimodalWindowDataset(args.data, seq_len=args.seq_len, stride=stride, files=train_files, backend='npz')
+    val_ds = MultimodalWindowDataset(args.data, seq_len=args.seq_len, stride=stride, files=val_files, backend='npz')
 
-    # optionally build a weighted sampler to balance by future_label (our main prediction target)
+    summarize_dataset(train_ds, 'Train split')
+    summarize_dataset(val_ds, 'Val split')
+
+    # optionally build a weighted sampler to balance by intent_label (our main prediction target)
     from torch.utils.data import WeightedRandomSampler
     if args.weighted_sampler:
         print('Building label weights for WeightedRandomSampler (this may take a moment)')
-        labels = []
-        for i in range(len(train_ds)):
-            lbl = int(train_ds[i]['future_label'].item())  # Use future_label since that's what we're predicting
-            labels.append(lbl)
-        labels = np.array(labels)
+        labels = np.array(train_ds.get_window_label_list(label_key='intent_label'))
         class_counts = np.bincount(labels, minlength=2)
         class_counts[class_counts == 0] = 1
         weights = np.array([1.0 / class_counts[l] for l in labels], dtype=np.float32)
@@ -147,18 +276,17 @@ def main():
     # compute class weights for CrossEntropy if requested
     class_weights = None
     if args.class_weighted:
-        # build label counts over training windows for FUTURE_LABEL (main prediction target)
-        lab_list = []
-        for i in range(len(train_ds)):
-            lab_list.append(int(train_ds[i]['future_label'].item()))
-        lab_arr = np.array(lab_list)
-        counts = np.bincount(lab_arr, minlength=2).astype(float)
+    # build label counts over training windows for intent_label (main prediction target)
+        counts = train_ds.get_label_counts(label_key='intent_label', num_classes=2).astype(float)
         counts[counts == 0] = 1.0
         inv = 1.0 / counts
         # normalize to sum=2 (so weights are comparable)
         inv = inv * (2.0 / inv.sum())
         class_weights = torch.tensor(inv, dtype=torch.float32, device=device)
         print('Using class weights for CE:', class_weights.tolist())
+
+    effective_train_steps = args.train_steps if args.train_steps is not None else math.ceil(len(train_ds) / args.batch)
+    print(f'Training batches per epoch: {effective_train_steps}')
 
     # Model with dynamic pose encoder support
     model = TransformerModel(
@@ -219,66 +347,31 @@ def main():
         total_loss_aux = 0.0
         train_preds = []
         train_gts = []
-        
+
         for batch in train_loader:
-            if train_steps >= args.train_steps:
+            if train_steps >= effective_train_steps:
                 break
-                
-            # Move to device
-            for k in ['pose', 'traj', 'has_pose', 'has_traj', 'label', 'future_label']:
-                if k in batch and torch.is_tensor(batch[k]):
-                    batch[k] = batch[k].to(device)
-            
+            move_batch_to_device(batch, device, args.pose_only)
+
             optim.zero_grad()
-            # Reduce modality dropout or remove it - it hurts convergence
-            out = model(batch, dropout_modality_probs=[0.0, 0.0])  # No dropout for better learning
-            logits = out['intent_logits']
-            # MAIN TASK: Predict FUTURE interaction (will they interact in next H seconds?)
-            # This is the useful prediction for robot decision-making
-            labels = batch['future_label']
-            
-            # Main intent head loss
-            # Use label smoothing to prevent overconfident predictions
-            if class_weights is not None:
-                loss_main = torch.nn.functional.cross_entropy(logits, labels, weight=class_weights, label_smoothing=0.1)
-            else:
-                loss_main = torch.nn.functional.cross_entropy(logits, labels, label_smoothing=0.1)
-            
-            # Auxiliary current interaction head loss (helps learning but not main task)
-            loss_aux = torch.tensor(0.0, device=device)
-            if 'future_logits' in out and 'label' in batch:
-                # Use future_logits to predict CURRENT interaction as auxiliary task
-                fut_logits = out['future_logits'].squeeze(-1)
-                curr_lbl = batch['label'].float()
-                
-                if args.use_focal:
-                    loss_aux = focal_loss_logits(fut_logits, curr_lbl, gamma=args.focal_gamma, alpha=args.focal_alpha)
-                else:
-                    # Compute pos_weight for imbalanced labels
-                    pos = (curr_lbl == 1).float().sum()
-                    neg = (curr_lbl == 0).float().sum()
-                    pos_weight = (neg / (pos + 1e-6)) if pos > 0 else 1.0
-                    # Fix: create tensor directly instead of from scalar
-                    bce = torch.nn.BCEWithLogitsLoss(pos_weight=torch.as_tensor(pos_weight, device=device))
-                    loss_aux = bce(fut_logits, curr_lbl)
-            
+            out = model(batch)
+            loss_main, loss_aux = compute_losses(out, batch, class_weights, args, device)
             loss = loss_main + args.aux_weight * loss_aux
             loss.backward()
-            
-            # Gradient clipping
+
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            
+
             optim.step()
 
             total_loss += loss.item()
             total_loss_main += loss_main.item()
             total_loss_aux += loss_aux.item()
-            preds = logits.argmax(dim=1).cpu().tolist()
+            preds = out['intent_logits'].argmax(dim=1).cpu().tolist()
             train_preds.extend(preds)
-            train_gts.extend(labels.cpu().tolist())
+            train_gts.extend(get_intent_targets(batch).cpu().tolist())
             train_steps += 1
-        
+
         avg_loss = total_loss / max(train_steps, 1)
         avg_loss_main = total_loss_main / max(train_steps, 1)
         avg_loss_aux = total_loss_aux / max(train_steps, 1)
@@ -296,61 +389,45 @@ def main():
         val_loss_main = 0.0
         val_loss_aux = 0.0
         val_steps = 0
-        
+        val_seq_labels = []
+        val_seq_indices = []
+
         with torch.no_grad():
             for batch in val_loader:
-                # Move to device
-                for k in ['pose', 'traj', 'has_pose', 'has_traj', 'label', 'future_label']:
-                    if k in batch and torch.is_tensor(batch[k]):
-                        batch[k] = batch[k].to(device)
-                
-                out = model(batch, dropout_modality_probs=[0.0, 0.0])
-                logits = out['intent_logits']
-                # MAIN TASK: Predict FUTURE interaction
-                labels = batch['future_label']
-                
-                # Main loss
-                if class_weights is not None:
-                    loss_main = torch.nn.functional.cross_entropy(logits, labels, weight=class_weights, label_smoothing=0.1)
-                else:
-                    loss_main = torch.nn.functional.cross_entropy(logits, labels, label_smoothing=0.1)
-                
-                # Auxiliary loss (current interaction)
-                loss_aux = torch.tensor(0.0, device=device)
-                if 'future_logits' in out and 'label' in batch:
-                    fut_logits = out['future_logits'].squeeze(-1)
-                    curr_lbl = batch['label'].float()
-                    
-                    if args.use_focal:
-                        loss_aux = focal_loss_logits(fut_logits, curr_lbl, gamma=args.focal_gamma, alpha=args.focal_alpha)
-                    else:
-                        pos = (curr_lbl == 1).float().sum()
-                        neg = (curr_lbl == 0).float().sum()
-                        pos_weight = (neg / (pos + 1e-6)) if pos > 0 else 1.0
-                        bce = torch.nn.BCEWithLogitsLoss(pos_weight=torch.as_tensor(pos_weight, device=device))
-                        loss_aux = bce(fut_logits, curr_lbl)
-                
+                move_batch_to_device(batch, device, args.pose_only)
+                out = model(batch)
+                loss_main, loss_aux = compute_losses(out, batch, class_weights, args, device)
                 val_loss += (loss_main + args.aux_weight * loss_aux).item()
                 val_loss_main += loss_main.item()
                 val_loss_aux += loss_aux.item()
-                preds = logits.argmax(dim=1).cpu().tolist()
+                preds = out['intent_logits'].argmax(dim=1).cpu().tolist()
                 val_preds.extend(preds)
-                val_gts.extend(labels.cpu().tolist())
+                val_gts.extend(get_intent_targets(batch).cpu().tolist())
+                val_seq_labels.extend(batch['sequence_label'].cpu().tolist())
+                val_seq_indices.extend(batch['source_index'].cpu().tolist())
                 val_steps += 1
-        
+
         avg_val_loss = val_loss / max(val_steps, 1)
         avg_val_loss_main = val_loss_main / max(val_steps, 1)
         avg_val_loss_aux = val_loss_aux / max(val_steps, 1)
-        val_met = compute_metrics(val_gts, val_preds)
+        window_metrics = compute_metrics(val_gts, val_preds)
+        seq_metrics = None
+        if args.eval_level in {'sequence', 'both'}:
+            seq_true, seq_pred = aggregate_by_sequence(val_preds, val_seq_labels, val_seq_indices, args.sequence_agg)
+            seq_metrics = compute_metrics(seq_true, seq_pred)
+
         print(f'  val: loss={avg_val_loss:.4f} (main={avg_val_loss_main:.4f}, aux={avg_val_loss_aux:.4f}) '
-              f'acc={val_met["accuracy"]:.3f} p={val_met["precision"]:.3f} '
-              f'r={val_met["recall"]:.3f} f1={val_met["f1"]:.3f}')
+              f'win_acc={window_metrics["accuracy"]:.3f} win_f1={window_metrics["f1"]:.3f}', end='')
+        if seq_metrics is not None:
+            print(f' | seq_acc={seq_metrics["accuracy"]:.3f} seq_f1={seq_metrics["f1"]:.3f}')
+        else:
+            print()
 
         # Learning rate scheduling - step every epoch
         scheduler.step()
 
         # Checkpointing
-        current_val_f1 = val_met['f1']
+        current_val_f1 = seq_metrics['f1'] if seq_metrics is not None else window_metrics['f1']
         if current_val_f1 > best_val_f1:
             best_val_f1 = current_val_f1
             patience_counter = 0
@@ -394,22 +471,33 @@ def main():
     
     y_true = []
     y_pred = []
+    y_seq_labels = []
+    y_seq_indices = []
     with torch.no_grad():
         for batch in val_loader:
-            for k in ['pose', 'traj', 'has_pose', 'has_traj', 'label', 'future_label']:
-                if k in batch and torch.is_tensor(batch[k]):
-                    batch[k] = batch[k].to(device)
-            out = model(batch, dropout_modality_probs=[0.0, 0.0])
-            logits = out['intent_logits']
-            preds = logits.argmax(dim=1).cpu().tolist()
-            lbls = batch['future_label'].cpu().tolist()  # Use future_label - that's what we're predicting!
+            move_batch_to_device(batch, device, args.pose_only)
+            out = model(batch)
+            preds = out['intent_logits'].argmax(dim=1).cpu().tolist()
+            lbls = get_intent_targets(batch).cpu().tolist()
             y_true.extend(lbls)
             y_pred.extend(preds)
+            y_seq_labels.extend(batch['sequence_label'].cpu().tolist())
+            y_seq_indices.extend(batch['source_index'].cpu().tolist())
 
-    final_metrics = compute_metrics(y_true, y_pred)
+    final_window = compute_metrics(y_true, y_pred)
+    final_seq = None
+    if args.eval_level in {'sequence', 'both'}:
+        seq_true, seq_pred = aggregate_by_sequence(y_pred, y_seq_labels, y_seq_indices, args.sequence_agg)
+        final_seq = compute_metrics(seq_true, seq_pred)
+
     print('\nFinal validation metrics (best model):')
-    for k, v in final_metrics.items():
-        print(f'  {k}: {v:.4f}' if isinstance(v, float) else f'  {k}: {v}')
+    print('  Window-level:')
+    for k, v in final_window.items():
+        print(f'    {k}: {v:.4f}' if isinstance(v, float) else f'    {k}: {v}')
+    if final_seq is not None:
+        print('  Sequence-level:')
+        for k, v in final_seq.items():
+            print(f'    {k}: {v:.4f}' if isinstance(v, float) else f'    {k}: {v}')
 
 
 if __name__ == '__main__':

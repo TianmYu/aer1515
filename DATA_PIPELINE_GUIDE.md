@@ -4,11 +4,26 @@
 
 This document describes the complete, correct data processing pipeline for pedestrian intent prediction. All old processing scripts and data have been removed and replaced with a single unified pipeline.
 
+> **Update (2025-11-13):** Legacy conversion utilities (e.g., `process_all_data.py`, `convert_dataset_approach.py`, `relabel_npz_future.py`) were archived under `archive/cleanup_2025-11-13_1530/scripts/`. Use the new `scripts/process_dataverse_and_mint.py` for Dataverse + MINT exports. The horizon-based Approach/Dataverse steps below now reference the archived script path for historical reproducibility.
+
 ## Quick Start
 
-### 1. Process Dataverse Dataset (Keypoint Pose + Trajectory)
+### 1. Process Dataverse + MINT (Multimodal, Recommended)
 ```bash
-python scripts/process_all_data.py --dataset dataverse --horizon 4.0 --output datasets/npz_h4s
+python scripts/process_dataverse_and_mint.py \
+  --dataverse-root datasets/dataverse_files \
+  --mint-root datasets/MINT-RVAE-Dataset-for-multimodal-intent-prediction-in-human-robot-interaction-main/data \
+  --output-dir datasets/processed
+```
+
+**Output:**
+- `datasets/processed/dataverse_npz/` (normalized Dataverse tracks + metadata)
+- `datasets/processed/mint_npz/` (cleaned MINT-RVAE sessions + metadata)
+- `datasets/processed/processing_summary.json` with aggregate stats
+
+### 2. (Legacy) Process Dataverse Dataset (Keypoint Pose + Trajectory)
+```bash
+python archive/cleanup_2025-11-13_1530/scripts/process_all_data.py --dataset dataverse --horizon 4.0 --output datasets/npz_h4s
 ```
 
 **Output:**
@@ -18,9 +33,9 @@ python scripts/process_all_data.py --dataset dataverse --horizon 4.0 --output da
 - Trajectory: 2 dimensions (pelvis_x, pelvis_y)
 - Label distribution: 18.3% positive (interacting), 48.1% future positive
 
-### 2. Process Approach Dataset (Trajectory Only)
+### 3. (Legacy) Process Approach Dataset (Trajectory Only)
 ```bash
-python scripts/process_all_data.py --dataset approach --horizon 4.0 --output datasets/npz_approach_h4s --mm-to-m --traj-only
+python archive/cleanup_2025-11-13_1530/scripts/process_all_data.py --dataset approach --horizon 4.0 --output datasets/npz_approach_h4s --mm-to-m --traj-only
 ```
 
 **Output:**
@@ -30,9 +45,9 @@ python scripts/process_all_data.py --dataset approach --horizon 4.0 --output dat
 - Trajectory: 2 dimensions (x, y in meters)
 - Label distribution: 54.0% positive (interacting), 53.6% future positive
 
-### 3. Process Approach Dataset (Motion Features + Trajectory)
+### 4. (Legacy) Process Approach Dataset (Motion Features + Trajectory)
 ```bash
-python scripts/process_all_data.py --dataset approach --horizon 4.0 --output datasets/npz_approach_motion_h4s --mm-to-m
+python archive/cleanup_2025-11-13_1530/scripts/process_all_data.py --dataset approach --horizon 4.0 --output datasets/npz_approach_motion_h4s --mm-to-m
 ```
 
 **Output:**
@@ -127,27 +142,38 @@ python scripts/train_and_eval.py \
 
 ## Processing Script Details
 
-### process_all_data.py
+### process_dataverse_and_mint.py (Active)
 
 **Features:**
-1. **Unified Pipeline**: Single script for both datasets
-2. **Automatic Validation**: Checks all NPZ files after processing
-3. **Correct Label Computation**: Future labels use exact horizon window
-4. **Metadata Generation**: Normalization statistics for trajectory
-5. **Error Handling**: Gracefully skips malformed files
+1. **Multimodal Export**: Merges Dataverse CSVs and MINT-RVAE sessions into aligned NPZ shards with pose, gaze, emotion, trajectory, and robot features.
+2. **Automatic Normalization**: Computes trajectory statistics and modality coverage ratios per export.
+3. **Robust Tracking**: Uses IoU-based association with configurable min-track and gap thresholds to keep tracks clean.
+4. **Rich Metadata**: Persists modality masks, frame labels, and summary JSON files for downstream auditing.
+5. **Honest Gaze Modality**: Gaze vectors are populated only when raw files provide explicit gaze fields; otherwise the gaze channel stays zeroed and masked, preventing synthetic estimates.
 
 **Arguments:**
-- `--dataset {dataverse,approach}`: Dataset type
-- `--output DIR`: Output directory for NPZ files
-- `--horizon FLOAT`: Future label horizon in seconds (default: 4.0)
-- `--sample-rate FLOAT`: Dataset sample rate in Hz (default: 5.0)
-- `--mm-to-m`: Convert millimeters to meters (for approach dataset)
-- `--traj-only`: Save trajectory only, no pose features
-- `--skip-validation`: Skip validation step (not recommended)
+- `--dataverse-root`: Path to pre-processed Dataverse CSV files (default `datasets/dataverse_files`).
+- `--mint-root`: Path to MINT-RVAE `feature_session_*.npz` files.
+- `--output-dir`: Target directory (creates `dataverse_npz` and `mint_npz`).
+- `--mint-min-track`: Minimum frames per MINT track before export (default 20).
+- `--mint-max-missed`: Allowed consecutive misses before a track is closed (default 2).
+- `--mint-iou-threshold`: IoU threshold for associating detections (default 0.35).
 
-**Data Sources:**
-- Dataverse: `datasets/dataverse_files/Lobby_1` and `Lobby_2`
-- Approach: `datasets/Dataset-approach/Dataset`
+**Sequence semantics:** Each exported NPZ corresponds to exactly one person and contains their entire available timeline (from the Dataverse PID group or a tracked MINT detection stream). The `intent_label` inside the NPZ is simply `1` if any frame in the sequence interacted with the robot and `0` otherwise, so non-interaction tracks are preserved intact.
+
+### Legacy process_all_data.py (Archived)
+
+- **Location:** `archive/cleanup_2025-11-13_1530/scripts/process_all_data.py`
+- **Features:**
+  1. **Unified Horizon Pipeline**: Single script for legacy Dataverse/Approach horizon datasets.
+  2. **Automatic Validation**: Checks NPZ files after processing.
+  3. **Correct Label Computation**: Future labels use exact horizon window.
+  4. **Metadata Generation**: Normalization statistics for trajectory.
+  5. **Error Handling**: Skips malformed files gracefully.
+- **Arguments:** Same as documented previously (`--dataset`, `--output`, `--horizon`, `--sample-rate`, `--mm-to-m`, `--traj-only`, `--skip-validation`).
+- **Data Sources:**
+  - Dataverse: `datasets/dataverse_files/Lobby_1` and `Lobby_2`
+  - Approach: `datasets/Dataset-approach/Dataset`
 
 ### Label Computation
 
@@ -207,9 +233,12 @@ Project/
 │       ├── *.npz
 │       └── metadata.json
 ├── scripts/
-│   ├── process_all_data.py      # ✓ NEW: Unified processing
-│   ├── train_and_eval.py        # ✓ UPDATED: Auto-detect single-modality
-│   └── convert_*.py             # ✗ DEPRECATED: Don't use
+│   ├── process_dataverse_and_mint.py  # Active multimodal exporter (Dataverse + MINT)
+│   ├── train_and_eval.py              # Auto-detects modality setups for training
+│   └── visualize_sequence.py          # Robot-frame pose playback
+├── archive/
+│   └── cleanup_2025-11-13_1530/
+│       └── scripts/                   # Legacy converters (process_all_data.py, convert_*.py, relabel_*.py)
 ├── pretrain.py                   # Self-supervised pretraining
 ├── transformer_model.py          # Dynamic multimodal model
 └── data_utils.py                 # Dataset loader

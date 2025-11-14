@@ -18,6 +18,25 @@ from data_utils import MultimodalWindowDataset, collate_fn
 from transformer_model import TransformerModel, count_parameters
 
 
+TENSOR_KEYS = [
+    'pose',
+    'gaze',
+    'emotion',
+    'traj',
+    'robot',
+    'modality_mask',
+    'frame_labels',
+    'label',
+    'future_label',
+    'intent_label',
+    'has_pose',
+    'has_gaze',
+    'has_emotion',
+    'has_traj',
+    'has_robot',
+]
+
+
 def set_seed(seed: int):
     """Set random seeds for reproducibility."""
     random.seed(seed)
@@ -86,10 +105,9 @@ def pretrain(args):
         
         for batch_idx, batch in enumerate(loader):
             # Move to device
-            batch['pose'] = batch['pose'].to(device)
-            batch['traj'] = batch['traj'].to(device)
-            batch['has_pose'] = batch['has_pose'].to(device)
-            batch['has_traj'] = batch['has_traj'].to(device)
+            for key in TENSOR_KEYS:
+                if key in batch and torch.is_tensor(batch[key]):
+                    batch[key] = batch[key].to(device)
             
             optimizer.zero_grad()
             
