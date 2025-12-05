@@ -299,7 +299,7 @@ def main():
 
             for pid, df_person in df_dict.items():
                 robot_df, human_df, gaze_df, robot_dpts, human_dpts = extract_columns(df_person)
-                # draw_points_matplot([robot_dpts, human_dpts])
+                draw_points_matplot([robot_dpts, human_dpts])
 
                 robot_trajs += [robot_dpts]
                 human_trajs += [human_dpts]
