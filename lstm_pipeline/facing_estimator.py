@@ -113,7 +113,19 @@ def estimate_facing_from_dptset(
                     perp = np.array([-sh_vec[1], sh_vec[0]])
                     # normalize perp for stability
                     perp_norm = perp / (np.linalg.norm(perp) + 1e-8)
+                    # Resolve sign ambiguity using nose relative to mid-shoulder
+                    try:
+                        mid2 = np.asarray(mid_sh)[:2]
+                        nose2 = np.asarray(nose)[:2]
+                        nose_vec2 = nose2 - mid2
+                        if np.dot(nose_vec2, perp_norm) < 0:
+                            perp_norm = -perp_norm
+                    except Exception:
+                        # if nose/mid unavailable or malformed, skip sign-correction
+                        pass
                     yaw = math.degrees(math.atan2(float(perp_norm[1]), float(perp_norm[0])))
+                    # normalize yaw to [-180, 180]
+                    yaw = ((yaw + 180.0) % 360.0) - 180.0
                     shoulder_width = float(np.linalg.norm(sh_vec))
                     # estimate subject scale from bbox of keypoints (2D)
                     pts_for_scale = []

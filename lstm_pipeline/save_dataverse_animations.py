@@ -126,12 +126,11 @@ def make_animation_for_dp(dp, out_path, max_frames=300, fps=30):
         facing_flag = ''
         try:
             ff = int(facing_arr[frame_idx]) if frame_idx < facing_arr.size else 0
+            # facing_arr is now binary {0,1}: 1 -> toward, 0 -> away/unknown
             if ff == 1:
                 facing_flag = 'toward'
-            elif ff == -1:
-                facing_flag = 'away'
             else:
-                facing_flag = 'unknown'
+                facing_flag = 'away'
         except Exception:
             facing_flag = ''
         title = f"frame {frame_idx} / {n_frames} | yaw={yaw:.1f}° | facing={facing_flag}"
